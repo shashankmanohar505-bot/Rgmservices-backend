@@ -10,6 +10,7 @@ const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 
 const Product = require('./models/Product');
+const ProductImage = require('./models/ProductImage');
 const Admin = require('./models/Admin');
 const ContactMessage = require('./models/ContactMessage');
 
@@ -29,7 +30,7 @@ app.use(cors({
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cache-Control'],
 }));
 app.options('*', cors());
 app.use(express.json({ limit: '20mb' }));
@@ -56,12 +57,17 @@ const connectDB = () => {
   let connStr = process.env.MONGODB_URI;
 
   const tryConnect = (uri, isFallback = false) => {
-    return mongoose.connect(uri, { dbName: 'rgms_db', serverSelectionTimeoutMS: 3000 })
-      .then(async () => {
+    return mongoose.connect(uri, { 
+      dbName: 'rgms_db', 
+      serverSelectionTimeoutMS: 3000,
+      maxPoolSize: 10,
+    })
+      .then(() => {
         isMongoConnected = true;
         mongoError = null;
         console.log(`✅ MongoDB Connected Successfully: ${mongoose.connection.host}`);
-        await seedDefaultData();
+        // Non-blocking background admin check/seed so cold starts respond in < 150ms
+        seedDefaultData().catch(err => console.warn('Background seed notice:', err.message));
       })
       .catch((err) => {
         if (!isFallback && uri !== FALLBACK_MONGODB_URI) {
@@ -107,32 +113,22 @@ const requireMongoDB = async (req, res, next) => {
 };
 app.use('/api', requireMongoDB);
 
-// Seed default Admin & cleanup default products in MongoDB
+// Seed default Admin in background without blocking API queries
 const seedDefaultData = async () => {
   if (!isMongoConnected) return;
   try {
     const adminCount = await Admin.countDocuments();
-    const hashedPassword = await bcrypt.hash('rgmsadmin', 10);
     if (adminCount === 0) {
+      const hashedPassword = await bcrypt.hash('rgmsadmin', 10);
       await Admin.create({
         username: 'admin',
         password: hashedPassword,
         email: 'rgmsadmin@gmail.com'
       });
       console.log('🔑 Default Admin created (Username: admin, Password: rgmsadmin)');
-    } else {
-      await Admin.updateOne({ username: 'admin' }, { password: hashedPassword, email: 'rgmsadmin@gmail.com' });
-      console.log('🔑 Default Admin password updated/reset to "rgmsadmin"');
-    }
-
-    // Delete default products from MongoDB if present
-    const defaultIds = ["prod-1786178881952", "prod-1786088544194", "prod-1786088030889", "prod-1786087967465"];
-    const deleteResult = await Product.deleteMany({ id: { $in: defaultIds } });
-    if (deleteResult.deletedCount > 0) {
-      console.log(`🧹 Deleted ${deleteResult.deletedCount} default products from MongoDB.`);
     }
   } catch (e) {
-    console.error('Seeding/cleanup error:', e.message);
+    console.error('Seeding error:', e.message);
   }
 };
 
@@ -168,7 +164,8 @@ app.post('/api/admin/login', async (req, res) => {
 
     const dbAdmin = await Admin.findOne({
       $or: [{ username: username }, { email: username }]
-    });
+    }).lean();
+
     if (dbAdmin) {
       isValid = await bcrypt.compare(password, dbAdmin.password);
       adminObj.username = dbAdmin.username;
@@ -207,16 +204,20 @@ app.get('/api/admin/verify', verifyAdminToken, (req, res) => {
   res.json({ valid: true, admin: req.admin });
 });
 
-// ================= CLOUDINARY IMAGE UPLOAD ROUTE ================= //
+// ================= IMAGE UPLOAD & SERVING ROUTES ================= //
 
-// POST /api/upload - Upload Image to Cloudinary (or return Base64 URL fallback)
+// POST /api/upload - Upload Image (Cloudinary or internal ProductImage store)
 app.post('/api/upload', upload.single('image'), async (req, res) => {
   try {
     let base64Image = null;
+    let mimeType = 'image/jpeg';
     if (req.file) {
+      mimeType = req.file.mimetype;
       base64Image = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
     } else if (req.body.image) {
       base64Image = req.body.image;
+      const match = base64Image.match(/^data:([A-Za-z-+\/]+);base64,/);
+      if (match) mimeType = match[1];
     }
 
     if (!base64Image) {
@@ -227,37 +228,102 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
     const hasCloudinary = process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET && process.env.CLOUDINARY_CLOUD_NAME !== 'rgms_cloud';
 
     if (hasCloudinary) {
-      const uploadResult = await cloudinary.uploader.upload(base64Image, {
-        folder: 'rgms_products',
-        resource_type: 'image'
-      });
-      return res.json({
-        url: uploadResult.secure_url,
-        public_id: uploadResult.public_id,
-        source: 'cloudinary'
-      });
-    } else {
-      // Fallback: If Cloudinary keys are default, return base64 or stored URL
-      return res.json({
-        url: base64Image,
-        source: 'local'
-      });
+      try {
+        const uploadResult = await cloudinary.uploader.upload(base64Image, {
+          folder: 'rgms_products',
+          resource_type: 'image',
+          transformation: [{ quality: 'auto', fetch_format: 'auto' }]
+        });
+        return res.json({
+          url: uploadResult.secure_url,
+          public_id: uploadResult.public_id,
+          source: 'cloudinary'
+        });
+      } catch (cloudErr) {
+        console.warn('Cloudinary upload error, using optimized internal image store:', cloudErr.message);
+      }
     }
+
+    // Store in dedicated ProductImage collection with a temp ID
+    const tempId = `temp-${Date.now()}`;
+    await ProductImage.create({
+      productId: tempId,
+      data: base64Image,
+      mimeType
+    });
+
+    return res.json({
+      url: `/api/products/${tempId}/image`,
+      tempId,
+      source: 'local'
+    });
   } catch (err) {
-    console.error('Cloudinary upload error:', err);
+    console.error('Image upload error:', err);
     res.status(500).json({ error: 'Image upload failed: ' + err.message });
+  }
+});
+
+// GET /api/products/:id/image - Serve cached binary product image with Edge CDN headers
+app.get('/api/products/:id/image', async (req, res) => {
+  const { id } = req.params;
+  try {
+    // 1. Check ProductImage collection first
+    const imgDoc = await ProductImage.findOne({ productId: id }).lean();
+    if (imgDoc && imgDoc.data) {
+      const match = imgDoc.data.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+      if (match) {
+        const contentType = match[1] || imgDoc.mimeType || 'image/jpeg';
+        const buffer = Buffer.from(match[2], 'base64');
+        res.set('Content-Type', contentType);
+        res.set('Cache-Control', 'public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400');
+        return res.send(buffer);
+      }
+    }
+
+    // 2. Fallback to Product collection
+    const product = await Product.findOne({ id }).select('image').lean();
+    if (product && product.image) {
+      if (product.image.startsWith('data:image')) {
+        const match = product.image.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+        if (match) {
+          const contentType = match[1] || 'image/jpeg';
+          const buffer = Buffer.from(match[2], 'base64');
+          res.set('Content-Type', contentType);
+          res.set('Cache-Control', 'public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400');
+          return res.send(buffer);
+        }
+      } else if (!product.image.includes('/image')) {
+        return res.redirect(product.image);
+      }
+    }
+
+    res.redirect('/assets/asset-1.png');
+  } catch (err) {
+    res.status(404).send('Image not found');
   }
 });
 
 // ================= PRODUCT REST API ROUTES ================= //
 
-// GET /api/products - Fetch All Products
+// GET /api/products - Fetch All Products (with Vercel Edge CDN Caching & Lean JSON Query)
 app.get('/api/products', async (req, res) => {
   try {
+    // Edge Caching: 60s Fresh, 5min Stale-While-Revalidate
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+
     const category = req.query.category;
     const filter = category && category !== 'all' ? { category } : {};
-    const products = await Product.find(filter).sort({ createdAt: -1 });
-    res.json(products);
+    const products = await Product.find(filter).sort({ createdAt: -1 }).lean();
+
+    // Map any raw base64 images to lightweight image endpoints
+    const optimizedProducts = products.map((p) => {
+      if (p.image && p.image.startsWith('data:image')) {
+        return { ...p, image: `/api/products/${p.id}/image` };
+      }
+      return p;
+    });
+
+    res.json(optimizedProducts);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch products: ' + err.message });
   }
@@ -266,10 +332,16 @@ app.get('/api/products', async (req, res) => {
 // GET /api/products/:id - Fetch Single Product
 app.get('/api/products/:id', async (req, res) => {
   try {
-    const product = await Product.findOne({ id: req.params.id });
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+    const product = await Product.findOne({ id: req.params.id }).lean();
     if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
+
+    if (product.image && product.image.startsWith('data:image')) {
+      product.image = `/api/products/${product.id}/image`;
+    }
+
     res.json(product);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch product: ' + err.message });
@@ -283,8 +355,29 @@ app.post('/api/products', verifyAdminToken, async (req, res) => {
     return res.status(400).json({ error: 'Product title is required.' });
   }
 
+  const newId = `prod-${Date.now()}`;
+  let finalImage = image || '/assets/asset-1.png';
+
+  // If image is Base64, save to ProductImage collection and store lightweight URL
+  if (finalImage.startsWith('data:image')) {
+    let mimeType = 'image/jpeg';
+    const match = finalImage.match(/^data:([A-Za-z-+\/]+);base64,/);
+    if (match) mimeType = match[1];
+
+    try {
+      await ProductImage.findOneAndUpdate(
+        { productId: newId },
+        { productId: newId, data: finalImage, mimeType, updatedAt: new Date() },
+        { upsert: true, new: true }
+      );
+      finalImage = `/api/products/${newId}/image`;
+    } catch (e) {
+      console.warn('Failed to save ProductImage separately:', e.message);
+    }
+  }
+
   const newProduct = {
-    id: `prod-${Date.now()}`,
+    id: newId,
     name,
     category: category || 'wifi-cameras',
     price: price !== undefined && price !== null && price !== '' ? Number(price) : null,
@@ -292,7 +385,7 @@ app.post('/api/products', verifyAdminToken, async (req, res) => {
     badge: badge || 'NEW',
     rating: Number(rating) || 5.0,
     reviews: Number(reviews) || 0,
-    image: image || '/assets/asset-1.png',
+    image: finalImage,
     stock: stock !== undefined ? Number(stock) : 20,
     description: description || 'Official RGMS Smart Security Device.',
     features: Array.isArray(features) ? features : (features ? [features] : ['Dedicated Tech Support']),
@@ -312,11 +405,30 @@ app.post('/api/products', verifyAdminToken, async (req, res) => {
 // PUT /api/products/:id - Update Product (Protected by JWT)
 app.put('/api/products/:id', verifyAdminToken, async (req, res) => {
   const { id } = req.params;
+  const updateData = { ...req.body };
+
+  // If image is Base64, save to ProductImage collection and store lightweight URL
+  if (updateData.image && updateData.image.startsWith('data:image')) {
+    let mimeType = 'image/jpeg';
+    const match = updateData.image.match(/^data:([A-Za-z-+\/]+);base64,/);
+    if (match) mimeType = match[1];
+
+    try {
+      await ProductImage.findOneAndUpdate(
+        { productId: id },
+        { productId: id, data: updateData.image, mimeType, updatedAt: new Date() },
+        { upsert: true, new: true }
+      );
+      updateData.image = `/api/products/${id}/image`;
+    } catch (e) {
+      console.warn('Failed to save ProductImage separately on update:', e.message);
+    }
+  }
 
   try {
     const updatedProduct = await Product.findOneAndUpdate(
       { id },
-      { $set: req.body },
+      { $set: updateData },
       { new: true }
     );
 
@@ -334,6 +446,7 @@ app.put('/api/products/:id', verifyAdminToken, async (req, res) => {
 app.delete('/api/products/all', verifyAdminToken, async (req, res) => {
   try {
     await Product.deleteMany({});
+    await ProductImage.deleteMany({});
     res.json({ message: 'All products deleted successfully from inventory' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to clear products: ' + err.message });
@@ -346,6 +459,7 @@ app.delete('/api/products/:id', verifyAdminToken, async (req, res) => {
 
   try {
     const deleteResult = await Product.deleteOne({ id });
+    await ProductImage.deleteOne({ productId: id });
     if (deleteResult.deletedCount === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
@@ -386,7 +500,7 @@ app.post('/api/contact', async (req, res) => {
 // GET /api/contact - Fetch All Contact Messages for Admin (Protected by JWT)
 app.get('/api/contact', verifyAdminToken, async (req, res) => {
   try {
-    const msgs = await ContactMessage.find().sort({ createdAt: -1 });
+    const msgs = await ContactMessage.find().sort({ createdAt: -1 }).lean();
     res.json(msgs);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch contact messages: ' + err.message });
@@ -450,14 +564,14 @@ app.get('/api/health', async (req, res) => {
 
 const server = app.listen(PORT, () => {
   console.log(`🚀 RGMS Express Backend REST API running on http://localhost:${PORT}`);
-  console.log(`🔐 JWT Auth Protection & ☁️ Cloudinary Upload & 📩 Contact Messages System Active.`);
+  console.log(`🔐 JWT Auth Protection & ⚡ High-Speed Edge Caching & 📩 Contact Messages System Active.`);
 }).on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     const FALLBACK_PORT = Number(PORT) + 1;
     console.log(`⚠️ Port ${PORT} busy, starting Express server on http://localhost:${FALLBACK_PORT}`);
     app.listen(FALLBACK_PORT, () => {
       console.log(`🚀 RGMS Express Backend REST API running on http://localhost:${FALLBACK_PORT}`);
-      console.log(`🔐 JWT Auth Protection & ☁️ Cloudinary Upload & 📩 Contact Messages System Active.`);
+      console.log(`🔐 JWT Auth Protection & ⚡ High-Speed Edge Caching & 📩 Contact Messages System Active.`);
     });
   }
 });

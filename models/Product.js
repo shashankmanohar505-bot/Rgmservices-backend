@@ -19,4 +19,11 @@ const productSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+// Performance Indexes for Fast Catalog Queries & Filtering
+productSchema.index({ category: 1, createdAt: -1 });
+productSchema.index({ createdAt: -1 });
+productSchema.index({ isDeal: 1 });
+productSchema.index({ isNewArrival: 1 });
+productSchema.index({ isBestSeller: 1 });
+
 module.exports = mongoose.model('Product', productSchema);
